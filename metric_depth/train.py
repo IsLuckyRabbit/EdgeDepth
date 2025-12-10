@@ -24,9 +24,9 @@ from util.metric import eval_depth
 from util.utils import init_log
 
 
-parser = argparse.ArgumentParser(description='Depth Anything V2 for Metric Depth Estimation')
+parser = argparse.ArgumentParser(description='EdgeDepth for Metric Depth Estimation')
 
-parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
+parser.add_argument('--encoder', default='efficientvit_b2', choices=['efficientvit_b1', 'efficientvit_b2', 'efficientvit_b3'])
 parser.add_argument('--dataset', default='hypersim', choices=['hypersim', 'vkitti'])
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.001, type=float)
@@ -38,6 +38,7 @@ parser.add_argument('--pretrained-from', type=str)
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
+parser.add_argument('--resume-from', default=None, type=str, help='Path to resume checkpoint')
 
 
 def main():
@@ -80,16 +81,22 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     
     model_configs = {
-        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+        'efficientvit_b1': {'encoder': 'efficientvit_b1', 'features': 64, 'out_channels': [32, 64, 128, 256]},
+        'efficientvit_b2': {'encoder': 'efficientvit_b2', 'features': 64, 'out_channels': [48, 96, 192, 384]},  # 'checkpoints/efficientvit_seg_b2_cityscapes.pt'
+        'efficientvit_b3': {'encoder': 'efficientvit_b3', 'features': 128, 'out_channels': [64, 128, 256, 512]},
+        'efficientvit_l0': {'encoder': 'efficientvit_l0', 'features': 128, 'out_channels': [64, 128, 256, 512]},
+        'efficientvit_l1': {'encoder': 'efficientvit_l1', 'features': 128, 'out_channels': [64, 128, 256, 512]},
+        'efficientvit_l2': {'encoder': 'efficientvit_l2', 'features': 128, 'out_channels': [64, 128, 256, 512]},
+        'efficientvit_l3': {'encoder': 'efficientvit_l3', 'features': 256, 'out_channels': [128, 256, 512, 1024]}
     }
+
     model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
     
     if args.pretrained_from:
-        model.load_state_dict({k: v for k, v in torch.load(args.pretrained_from, map_location='cpu').items() if 'pretrained' in k}, strict=False)
-    
+        pretrained_weights = torch.load(args.pretrained_from, map_location='cpu')
+        backbone_state_dict = {k.replace('backbone.', ''): v for k, v in pretrained_weights['state_dict'].items() if k.startswith('backbone.')}
+        model.pretrained.load_state_dict(backbone_state_dict, strict=False)\
+        
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda(local_rank)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False,
@@ -101,9 +108,18 @@ def main():
                        {'params': [param for name, param in model.named_parameters() if 'pretrained' not in name], 'lr': args.lr * 10.0}],
                       lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
     
+    if args.resume_from and os.path.exists(args.resume_from):
+        checkpoint = torch.load(args.resume_from, map_location='cpu')
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch'] + 1
+        previous_best = checkpoint['previous_best']
+        previous_target_best = checkpoint['previous_target_best']
+    else:
+        start_epoch = 0
+        previous_best = {'d1': 0, 'd2': 0, 'd3': 0, 'abs_rel': 100, 'sq_rel': 100, 'rmse': 100, 'rmse_log': 100, 'log10': 100, 'silog': 100}
+        
     total_iters = args.epochs * len(trainloader)
-    
-    previous_best = {'d1': 0, 'd2': 0, 'd3': 0, 'abs_rel': 100, 'sq_rel': 100, 'rmse': 100, 'rmse_log': 100, 'log10': 100, 'silog': 100}
     
     for epoch in range(args.epochs):
         if rank == 0:
@@ -206,6 +222,21 @@ def main():
                 'previous_best': previous_best,
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
+
+            # 保存最佳模型
+            current_d1 = (results['d1'] / nsamples).item()
+            if current_d1  < previous_best['d1']: 
+                pass
+            else:
+                logger.info(f"New best model found at epoch {epoch} with d1 = {current_d1 :.4f}")
+                torch.save(checkpoint, os.path.join(args.save_path, 'd1_best_model.pth'))
+            
+            current_abs_rel = (results['abs_rel'] / nsamples).item() 
+            if current_abs_rel  > previous_best['abs_rel']: 
+                pass
+            else:
+                logger.info(f"New best model found at epoch {epoch} with abs_rel = {current_abs_rel :.4f}")
+                torch.save(checkpoint, os.path.join(args.save_path, 'abs_best_model.pth'))
 
 
 if __name__ == '__main__':

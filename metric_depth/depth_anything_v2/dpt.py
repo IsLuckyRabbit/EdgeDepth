@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import Compose
 
-from .dinov2 import DINOv2
+from .efficientvit_mit import EfficientViT
 from .util.blocks import FeatureFusionBlock, _make_scratch
 from .util.transform import Resize, NormalizeImage, PrepareForNet
 
@@ -114,22 +114,8 @@ class DPTHead(nn.Module):
         )
     
     def forward(self, out_features, patch_h, patch_w):
-        out = []
-        for i, x in enumerate(out_features):
-            if self.use_clstoken:
-                x, cls_token = x[0], x[1]
-                readout = cls_token.unsqueeze(1).expand_as(x)
-                x = self.readout_projects[i](torch.cat((x, readout), -1))
-            else:
-                x = x[0]
-            
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
-            
-            x = self.projects[i](x)
-            x = self.resize_layers[i](x)
-            
-            out.append(x)
-        
+        out = out_features.copy()
+
         layer_1, layer_2, layer_3, layer_4 = out
         
         layer_1_rn = self.scratch.layer1_rn(layer_1)
@@ -152,33 +138,31 @@ class DPTHead(nn.Module):
 class DepthAnythingV2(nn.Module):
     def __init__(
         self, 
-        encoder='vitl', 
-        features=256, 
-        out_channels=[256, 512, 1024, 1024], 
+        encoder='efficientvit_b2', 
+        features=64, 
+        out_channels=[48, 96, 192, 384], 
         use_bn=False, 
         use_clstoken=False,
         max_depth=20.0
     ):
         super(DepthAnythingV2, self).__init__()
         
-        self.intermediate_layer_idx = {
-            'vits': [2, 5, 8, 11],
-            'vitb': [2, 5, 8, 11], 
-            'vitl': [4, 11, 17, 23], 
-            'vitg': [9, 19, 29, 39]
-        }
-        
         self.max_depth = max_depth
         
         self.encoder = encoder
-        self.pretrained = DINOv2(model_name=encoder)
+        self.pretrained = EfficientViT(model_name=encoder)
         
-        self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
+        self.depth_head = DPTHead(self.pretrained.width_list[-1], features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
     
     def forward(self, x):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
         
-        features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
+        backbone_output = self.pretrained(x)
+
+        features = [backbone_output["stage1"],
+                    backbone_output["stage2"],
+                    backbone_output["stage3"],
+                    backbone_output["stage4"]]
         
         depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
         
